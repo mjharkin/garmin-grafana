@@ -1059,10 +1059,20 @@ def get_fitness_age(date_str):
                 "achievableFitnessAge": fitness_age.get("achievableFitnessAge"),
             }
 
+            components = ["bodyFat", "vigorousDaysAvg", "rhr", "vigorousMinutesAvg"]
+            componentValues = ["value", "targetValue", "improvementValue", "potentialAge", "priority", "stale",
+                               "numOfWeeksForIm"]
+            for component in components:
+                componentDict = fitness_age.get("components") or {}
+                for componentValue in componentValues:
+                    data_fields[component + "_" + componentValue] = (componentDict.get(component) or {}).get(
+                        componentValue, None)
+
             if not all(value is None for value in data_fields.values()):
                 points_list.append({
                     "measurement": "FitnessAge",
-                    "time": datetime.strptime(date_str,"%Y-%m-%d").replace(hour=0, tzinfo=pytz.UTC).isoformat(), # Use GMT 00:00 for daily record
+                    "time": datetime.strptime(date_str, "%Y-%m-%d").replace(hour=0, tzinfo=pytz.UTC).isoformat(),
+                    # Use GMT 00:00 for daily record
                     "tags": {
                         "Device": GARMIN_DEVICENAME,
                         "Database_Name": INFLUXDB_DATABASE
