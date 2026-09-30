@@ -1033,6 +1033,28 @@ def _build_cycling_dynamics_point(all_records_list, all_sessions_list, activityI
     }
 
 # %%
+def _lap_speed_fields(lap):
+    """Lap average and max speed, with fallbacks for sports whose FIT carries no speed.
+
+    Swim lap messages carry neither `avg_speed` nor `enhanced_avg_speed` - Garmin fills
+    speed on the *length* messages only - so without this every swim lap, open-water and
+    pool alike, has no speed at all. total_distance over total_timer_time is the pace the
+    watch shows, in metres per second. Max speed cannot be derived, so it only gains the
+    non-enhanced fallback.
+    """
+    speed = lap.get('enhanced_avg_speed')
+    if speed is None:
+        speed = lap.get('avg_speed')
+    if speed is None:
+        distance, timer = lap.get('total_distance'), lap.get('total_timer_time')
+        if distance and timer: # a rest lap has no distance: leave it unknown rather than 0, which a pace panel would divide by
+            speed = float(distance) / float(timer)
+    max_speed = lap.get('enhanced_max_speed')
+    if max_speed is None:
+        max_speed = lap.get('max_speed')
+    return {"Avg_Speed": speed, "Max_Speed": max_speed}
+
+
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -1171,8 +1193,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_Stroke_Distance": lap_record.get('avg_stroke_distance', None),
                                     "Moving_Duration": lap_record.get('total_moving_time', None),
                                     "Standing_Duration": lap_record.get('time_standing', None),
-                                    "Avg_Speed": lap_record.get('enhanced_avg_speed', None),
-                                    "Max_Speed": lap_record.get('enhanced_max_speed', None),
+                                    **_lap_speed_fields(lap_record), # avg/max speed, avg derived from distance / timer time when the FIT lap has no speed field (every swim lap)
                                     "Calories": lap_record.get('total_calories', None),
                                     "Avg_Power": lap_record.get('avg_power', None),
                                     "Avg_HR": lap_record.get('avg_heart_rate', None),
