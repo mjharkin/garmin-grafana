@@ -7,6 +7,10 @@ from datetime import datetime, timedelta
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError
 from influxdb_client_3 import InfluxDBClient3, InfluxDBError
+try: # package context (`garmin-fetch` console script)
+    from .swim_fields import swim_summary_fields, swim_lap_fields, swim_length_fields
+except ImportError: # script context (`python garmin_grafana/garmin_fetch.py`, the Dockerfile CMD)
+    from swim_fields import swim_summary_fields, swim_lap_fields, swim_length_fields
 import xml.etree.ElementTree as ET
 from garminconnect import (
     Garmin,
@@ -65,6 +69,7 @@ LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").uppe
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
 FIT_FILE_STORAGE_LOCATION = os.getenv("FIT_FILE_STORAGE_LOCATION", os.path.join(os.path.expanduser("~"), "fit_filestore"))
 ALWAYS_PROCESS_FIT_FILES = True if os.getenv("ALWAYS_PROCESS_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional, will process all FIT files for all activities including indoor ones lacking GPS data
+ALWAYS_PROCESS_ACTIVITY_TYPES = [t.strip().lower() for t in os.getenv("ALWAYS_PROCESS_ACTIVITY_TYPES", "lap_swimming,open_water_swimming").split(",") if t.strip()] # optional, comma-separated activity typeKeys whose FIT files are always processed even without GPS data. Pool swims carry no GPS but do carry the lap/length detail, so swims are on by default. Set to an empty string to disable.
 REQUEST_INTRADAY_DATA_REFRESH = True if os.getenv("REQUEST_INTRADAY_DATA_REFRESH") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional, This requests data refresh for the intraday data (older than 6 months) - see issue #77. Pauses the script for 24 hours when the daily limit is reached.
 IGNORE_INTRADAY_DATA_REFRESH_DAYS = int(os.getenv("IGNORE_INTRADAY_DATA_REFRESH_DAYS", 30)) # optional, ignores the REQUEST_INTRADAY_DATA_REFRESH for the specified number of days from current date. 
 TAG_MEASUREMENTS_WITH_USER_EMAIL = True if os.getenv("TAG_MEASUREMENTS_WITH_USER_EMAIL") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # Adds an additional "User_ID" tag in each measurement for multi user database support - see #96
@@ -661,9 +666,10 @@ def get_activity_summary(date_str):
         logging.info(f"ACTIVITY_TYPE_FILTER active: kept {len(activity_list)} activities matching {ACTIVITY_TYPE_FILTER}")
     for activity in activity_list:
         activity_type_key = (activity.get('activityType') or {}).get('typeKey', "Unknown")
-        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES: # will process FIT files lacking GPS data if ALWAYS_PROCESS_FIT_FILES is set to True
+        fit_process_by_type = activity_type_key.lower() in ALWAYS_PROCESS_ACTIVITY_TYPES
+        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES or fit_process_by_type: # will process FIT files lacking GPS data if ALWAYS_PROCESS_FIT_FILES is set to True, or if the activity type is listed in ALWAYS_PROCESS_ACTIVITY_TYPES
             if not activity.get('hasPolyline'):
-                logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
+                logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as {'ALWAYS_PROCESS_FIT_FILES is on' if ALWAYS_PROCESS_FIT_FILES else f'activity type {activity_type_key} is in ALWAYS_PROCESS_ACTIVITY_TYPES'}")
             activity_with_gps_id_dict[activity.get('activityId')] = activity_type_key
         # Collect strength training activities for API-based exercise set fetching
         if 'strength' in activity_type_key.lower() and activity.get('startTimeGMT'):
@@ -726,6 +732,7 @@ def get_activity_summary(date_str):
                     'activityTrainingLoad': activity.get('activityTrainingLoad'),
                     'moderateIntensityMinutes': activity.get('moderateIntensityMinutes'),
                     'vigorousIntensityMinutes': activity.get('vigorousIntensityMinutes'),
+                    **swim_summary_fields(activity, activity_type_key), # swim only (SWOLF, strokes, pool length, active lengths); empty for other sports
                 }
             })
             points_list.append({
@@ -1032,7 +1039,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
         activity_type = activityIDdict[activityID]
         if (activityID in PARSED_ACTIVITY_ID_LIST) and (not FORCE_REPROCESS_ACTIVITIES):
             logging.info(f"Skipping : Activity ID {activityID} has already been processed within current runtime")
-            return []
+            continue # must not abandon the remaining activities in this batch
         if (activityID in PARSED_ACTIVITY_ID_LIST) and (FORCE_REPROCESS_ACTIVITIES):
             logging.info(f"Re-processing : Activity ID {activityID} (FORCE_REPROCESS_ACTIVITIES is on)")
         try:
@@ -1110,8 +1117,8 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Sub_Sport": str(session_record.get('sub_sport', None)),
                                     "Pool_Length": session_record.get('pool_length', None),
                                     "Pool_Length_Unit": session_record.get('pool_length_unit', None),
-                                    "Lengths": session_record.get('num_laps', None),
-                                    "Laps": session_record.get('num_lengths', None),
+                                    "Lengths": session_record.get('num_active_lengths', None), # fitparse does not resolve num_lengths; active lengths is the length count available
+                                    "Laps": session_record.get('num_laps', None),
                                     "Aerobic_Training": session_record.get('total_training_effect', None),
                                     "Anaerobic_Training": session_record.get('total_anaerobic_training_effect', None),
                                     "Primary_Benefit": session_record.get('primary_benefit', None),
@@ -1134,12 +1141,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Index": int(length_record.get('message_index', -1)) + 1,
                                     "ActivityName": activity_type,
                                     "Activity_ID": activityID,
-                                    "Elapsed_Time": length_record.get('total_elapsed_time', None),
-                                    "Strokes": length_record.get('total_strokes', None),
-                                    "Swim_Stroke": length_record.get('swim_stroke', None),
-                                    "Avg_Speed": length_record.get('avg_speed', None),
-                                    "Calories": length_record.get('total_calories', None),
-                                    "Avg_Cadence": length_record.get('avg_swimming_cadence', None)
+                                    **swim_length_fields(length_record), # time, strokes, stroke type, length type (active|idle), speed, cadence, derived SWOLF
                                 }
                             }
                             points_list.append(point)
@@ -1180,7 +1182,8 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_Vertical_Oscillation": lap_record.get('avg_vertical_oscillation', None),
                                     "Avg_Stance_Time": lap_record.get('avg_stance_time', None),
                                     "Avg_Vertical_Ratio": lap_record.get('avg_vertical_ratio', None),
-                                    "Avg_Step_Length": lap_record.get('avg_step_length', None)
+                                    "Avg_Step_Length": lap_record.get('avg_step_length', None),
+                                    **swim_lap_fields(lap_record), # swim laps only: SWOLF, strokes, active lengths, stroke type, prescribed step index
                                 }
                             }
                             points_list.append(point)
@@ -1217,10 +1220,10 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                     logging.info(f"Success : Activity ID {activityID} stored in output file {tcx_path}")
             except requests.exceptions.Timeout as err:
                 logging.warning(f"Request timeout for fetching large activity record {activityID} - skipping record")
-                return []
+                continue # must not abandon the remaining activities in this batch
             except Exception as err:
                 logging.exception(f"Unable to fetch TCX for activity record {activityID} : skipping record")
-                return []
+                continue # must not abandon the remaining activities in this batch
 
             for activity in root.findall("tcx:Activities/tcx:Activity", ns):
                 activity_start_time = datetime.fromisoformat(activity.find("tcx:Id", ns).text.strip("Z"))
