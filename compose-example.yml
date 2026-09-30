@@ -34,6 +34,7 @@ services:
       # - FETCH_SELECTION=daily_avg,sleep,steps,heartrate,stress,breathing,hrv,vo2,activity,race_prediction,body_composition # This enables selection of fetch data : Check Discussion #119 to know what additional options are available (add them seperated by , but without a space)
       # - KEEP_FIT_FILES=False # Stores the FIT files (downloads and saves them) when set to True - read docs for more details
       # - ALWAYS_PROCESS_FIT_FILES=False # Enables processing FIT files even if GPS data is not present in it when set to True, default False
+      # - ALWAYS_PROCESS_ACTIVITY_TYPES=lap_swimming,open_water_swimming # Comma separated activity typeKeys that are always processed even if they have no GPS data. Pool swims never have GPS but carry the per lap / per length detail, so swims are the default. Set to an empty string to disable.
       # - USER_TIMEZONE= # Can hardcode user's timezone - must be a valid TZ identifier like Europe/Budapest without quotes, fetches timezone automatically and dynamically on each run if set to empty (default) - Read docs
       # - INFLUXDB_ENDPOINT_IS_HTTP=True # Set this to False if you are using HTTPS for your influxdb connection (over the internet)
       # - FORCE_REPROCESS_ACTIVITIES=True # Enables re-processing of FIT files on iterative updates when set to True (default), setting to False may save processing time but known for skipping activities

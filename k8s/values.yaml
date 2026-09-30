@@ -94,6 +94,9 @@ garmin:
       value: "1"
     - name: ALWAYS_PROCESS_FIT_FILES
       value: "True"
+    # Swims never have GPS data; without this their lap/length detail is skipped
+    - name: ALWAYS_PROCESS_ACTIVITY_TYPES
+      value: "lap_swimming,open_water_swimming"
     - name: FETCH_INTERVAL
       value: "15min"
     # - name: MANUAL_START_DATE # will cause batch mode / restarts
