@@ -1905,6 +1905,7 @@ if __name__ == "__main__":
             logging.warning(f"Unable to determine user's timezone - Defaulting to UTC. Consider providing TZ identifier with USER_TIMEZONE environment variable")
             local_timediff = timedelta(hours=0)
         
+        next_device_probe = 0 # probe once on startup, then on the interval
         while True:
             last_watch_sync_time_UTC = datetime.fromtimestamp(int(garmin_obj.get_device_last_used().get('lastUsedDeviceUploadTime')/1000)).astimezone(pytz.timezone("UTC"))
             if last_influxdb_sync_time_UTC < last_watch_sync_time_UTC:
@@ -1913,5 +1914,25 @@ if __name__ == "__main__":
                 last_influxdb_sync_time_UTC = last_watch_sync_time_UTC
             else:
                 logging.info(f"No new data found : Current watch and influxdb sync time is {last_watch_sync_time_UTC} UTC")
+
+            # Scale and blood-pressure readings arrive from devices the watch sync clock knows
+            # nothing about, so they are checked on their own interval and compared against what
+            # InfluxDB already holds. Only metrics named in FETCH_SELECTION are touched.
+            if DEVICE_PROBE_INTERVAL_SECONDS > 0 and time.time() >= next_device_probe:
+                next_device_probe = time.time() + DEVICE_PROBE_INTERVAL_SECONDS
+                today_local = (datetime.now(tz=pytz.timezone("UTC")) + local_timediff).strftime('%Y-%m-%d')
+                if 'body_composition' in FETCH_SELECTION:
+                    newest = _newest_weigh_in_time(today_local)
+                    stored = _latest_point_time("BodyComposition")
+                    if newest is not None and (stored is None or newest > stored):
+                        logging.info(f"Update found : weigh-in at {newest} is newer than the stored point ({stored}) - the watch has not synced")
+                        fetch_write_devices(today_local)
+                if 'blood_pressure' in FETCH_SELECTION:
+                    newest = _newest_blood_pressure_time(today_local)
+                    stored = _latest_point_time("BloodPressure")
+                    if newest is not None and (stored is None or newest > stored):
+                        logging.info(f"Update found : blood pressure at {newest} is newer than the stored point ({stored}) - the watch has not synced")
+                        fetch_write_devices(today_local)
+
             logging.info(f"waiting for {UPDATE_INTERVAL_SECONDS} seconds before next automatic update calls")
             time.sleep(UPDATE_INTERVAL_SECONDS)
