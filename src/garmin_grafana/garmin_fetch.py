@@ -729,6 +729,7 @@ def get_activity_summary(date_str):
                     'activityTrainingLoad': activity.get('activityTrainingLoad'),
                     'moderateIntensityMinutes': activity.get('moderateIntensityMinutes'),
                     'vigorousIntensityMinutes': activity.get('vigorousIntensityMinutes'),
+                    **_swim_summary_fields(activity, activity_type_key), # swim only; {} for other sports, so those rows are unchanged
                 }
             })
             points_list.append({
@@ -1029,6 +1030,118 @@ def _build_cycling_dynamics_point(all_records_list, all_sessions_list, activityI
     }
 
 # %%
+# %%
+# Swim detail. These mappings return {} for other sports, so a caller can spread them into
+# the point dict unconditionally and leave other activities' points untouched. A pool swim
+# records no GPS, so its FIT file is only read when FIT processing is enabled for it.
+
+_POOL_LENGTH_CM_THRESHOLD = 200 # a pool length above this arrives in centimetres (2500.0 = 25 m)
+_SWOLF_MIN, _SWOLF_MAX = 5, 500 # plausible SWOLF band; outside it field 73 is not SWOLF
+
+
+def _is_swim_type(activity_type):
+    return "swim" in str(activity_type or "").lower()
+
+
+def _is_swim_lap(lap):
+    """Decide from the lap itself, never from a key merely being present - a run's laps carry
+    the swim keys with a None value."""
+    if "swim" in str(lap.get('sport', '')).lower() or "swim" in str(lap.get('sub_sport', '')).lower():
+        return True
+    return any(lap.get(key) is not None for key in ('swim_stroke', 'num_lengths', 'num_active_lengths'))
+
+
+def _num(mapping, *keys):
+    """First non-None value among keys, as float - InfluxDB fixes a field's type at its first
+    write, so sending an int into a float field is rejected as a type conflict."""
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _swolf(value):
+    """SWOLF from FIT field 73, or None when the value cannot be SWOLF."""
+    if value is None:
+        return None
+    try:
+        swolf = float(value)
+    except (TypeError, ValueError):
+        return None
+    return swolf if _SWOLF_MIN < swolf < _SWOLF_MAX else None
+
+
+def _swim_summary_fields(activity, activity_type):
+    """Session-level swim metrics from the daily summary call the sync already makes."""
+    if not _is_swim_type(activity_type):
+        return {}
+    pool_length = _num(activity, 'poolLength')
+    if pool_length is not None and pool_length > _POOL_LENGTH_CM_THRESHOLD:
+        pool_length = pool_length / 100.0
+    return {
+        'totalStrokes': _num(activity, 'strokes', 'totalNumberOfStrokes'),
+        'averageSWOLF': _num(activity, 'averageSwolf', 'averageSWOLF'),
+        'averageSwimCadence': _num(activity, 'averageSwimCadenceInStrokesPerMinute', 'averageSwimCadence'),
+        'avgStrokesPerLength': _num(activity, 'avgStrokes', 'averageStrokes'),
+        'activeLengths': _num(activity, 'activeLengths', 'numberOfActiveLengths'),
+        'poolLength': pool_length,
+    }
+
+
+def _swim_lap_fields(lap):
+    """Swim-only per-lap fields. SWOLF is not in the FIT profile, so fitparse leaves it as the
+    numeric field unknown_73, as does the official SDK; the value agrees lap for lap with
+    Garmin's own averageSWOLF. Per-lap strokes live in total_cycles, which fitparse resolves
+    where it resolves neither total_work nor its total_strokes subfield; it is the same number
+    the lap row already carries as Cycles."""
+    if not _is_swim_lap(lap):
+        return {}
+    return {
+        'SWOLF': _swolf(lap.get('unknown_73')), # FIT lap field 73, unnamed in the SDK
+        'Strokes': lap.get('total_cycles'),
+        'Active_Lengths': lap.get('num_active_lengths'),
+        'Swim_Stroke': str(lap['swim_stroke']) if lap.get('swim_stroke') is not None else None,
+        'Wkt_Step_Index': lap.get('wkt_step_index'),
+    }
+
+
+def _swim_lap_speed_fields(lap):
+    """Swim laps have no speed: Garmin writes it on the length messages instead, so
+    total_distance over total_timer_time is the pace the watch shows. Max speed cannot be
+    derived, so it only gains the non-enhanced fallback. A rest lap has no distance and stays
+    unknown rather than 0, which a pace panel would divide by."""
+    if not _is_swim_lap(lap):
+        return {}
+    speed = lap.get('enhanced_avg_speed')
+    if speed is None:
+        speed = lap.get('avg_speed')
+    if speed is None:
+        distance, timer = lap.get('total_distance'), lap.get('total_timer_time')
+        if distance is not None and timer:
+            speed = float(distance) / float(timer)
+    max_speed = lap.get('enhanced_max_speed')
+    if max_speed is None:
+        max_speed = lap.get('max_speed')
+    return {'Avg_Speed': speed, 'Max_Speed': max_speed}
+
+
+def _swim_length_extras(length):
+    """Per-length fields that are new here; the ones that already existed stay in the point
+    dict where they were. Only swim FIT files contain length messages at all, so there is no
+    sport gate. length_type is active | idle, which tells a swum length from a rest, and SWOLF
+    is derived because the FIT carries no per-length value."""
+    elapsed = length.get('total_elapsed_time')
+    strokes = length.get('total_strokes')
+    swolf = None
+    if elapsed is not None and strokes is not None:
+        swolf = float(elapsed) + float(strokes)
+    return {
+        'Timer_Time': length.get('total_timer_time'),
+        'Length_Type': str(length['length_type']) if length.get('length_type') is not None else None,
+        'SWOLF': swolf,
+    }
+
 def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back to TCX
     points_list = []
     for activityID in activityIDdict.keys():
@@ -1116,6 +1229,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Pool_Length_Unit": session_record.get('pool_length_unit', None),
                                     "Lengths": session_record.get('num_laps', None),
                                     "Laps": session_record.get('num_lengths', None),
+                                    "Active_Lengths": session_record.get('num_active_lengths', None), # new field: lengths actually swum, excluding rests
                                     "Aerobic_Training": session_record.get('total_training_effect', None),
                                     "Anaerobic_Training": session_record.get('total_anaerobic_training_effect', None),
                                     "Primary_Benefit": session_record.get('primary_benefit', None),
@@ -1143,7 +1257,8 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Swim_Stroke": length_record.get('swim_stroke', None),
                                     "Avg_Speed": length_record.get('avg_speed', None),
                                     "Calories": length_record.get('total_calories', None),
-                                    "Avg_Cadence": length_record.get('avg_swimming_cadence', None)
+                                    "Avg_Cadence": length_record.get('avg_swimming_cadence', None),
+                                    **_swim_length_extras(length_record), # timer time, length type (active|idle) and derived SWOLF
                                 }
                             }
                             points_list.append(point)
@@ -1175,6 +1290,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Standing_Duration": lap_record.get('time_standing', None),
                                     "Avg_Speed": lap_record.get('enhanced_avg_speed', None),
                                     "Max_Speed": lap_record.get('enhanced_max_speed', None),
+                                    **_swim_lap_speed_fields(lap_record), # swim laps only: the FIT lap message carries no speed, so derive it
                                     "Calories": lap_record.get('total_calories', None),
                                     "Avg_Power": lap_record.get('avg_power', None),
                                     "Avg_HR": lap_record.get('avg_heart_rate', None),
@@ -1184,7 +1300,8 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_Vertical_Oscillation": lap_record.get('avg_vertical_oscillation', None),
                                     "Avg_Stance_Time": lap_record.get('avg_stance_time', None),
                                     "Avg_Vertical_Ratio": lap_record.get('avg_vertical_ratio', None),
-                                    "Avg_Step_Length": lap_record.get('avg_step_length', None)
+                                    "Avg_Step_Length": lap_record.get('avg_step_length', None),
+                                    **_swim_lap_fields(lap_record), # swim laps only: SWOLF, strokes, active lengths, stroke type, workout step index
                                 }
                             }
                             points_list.append(point)
