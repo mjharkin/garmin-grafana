@@ -1698,6 +1698,24 @@ def get_lifestyle_data(date_str):
 
 
 # %%
+def _resolve_device_name():
+    """Fill GARMIN_DEVICENAME/GARMIN_DEVICEID from Garmin before anything is written.
+
+    Points are tagged with the device name, and InfluxDB treats a different tag value as a
+    different series: a point written while the name is still the "Unknown" default puts the
+    same reading in the database twice. get_last_sync() does this too, but only as a side effect
+    of a bulk fetch, which is exactly what has not happened yet on the watch-independent path.
+    """
+    global GARMIN_DEVICENAME, GARMIN_DEVICEID
+    try:
+        sync_data = garmin_obj.get_device_last_used()
+    except Exception as err:
+        logging.warning(f"Could not resolve the Garmin device name: {err}")
+        return
+    GARMIN_DEVICENAME = sync_data.get('lastUsedDeviceName') or "Unknown"
+    GARMIN_DEVICEID = sync_data.get('userDeviceId') or None
+
+
 def fetch_write_devices(date_str):
     """Write only the measurements that come from devices other than the watch.
 
@@ -1706,6 +1724,8 @@ def fetch_write_devices(date_str):
     it, so a deployment that does not collect blood pressure neither polls nor writes it.
     Points are keyed by the reading's own timestamp, so re-running this is idempotent.
     """
+    if GARMIN_DEVICENAME_AUTOMATIC and GARMIN_DEVICENAME == "Unknown":
+        _resolve_device_name() # once: every point must carry the real device name, see the helper
     written = 0
     if 'body_composition' in FETCH_SELECTION:
         try:
