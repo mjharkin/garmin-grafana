@@ -1103,13 +1103,15 @@ def _swim_lap_fields(lap):
     }
 
 
-def _swim_lap_speed_fields(lap):
-    """Swim laps have no speed: Garmin writes it on the length messages instead, so
-    total_distance over total_timer_time is the pace the watch shows. Max speed cannot be
-    derived, so it only gains the non-enhanced fallback. A rest lap has no distance and stays
-    unknown rather than 0, which a pace panel would divide by."""
-    if not _is_swim_lap(lap):
-        return {}
+def _lap_speed_fields(lap):
+    """Lap average and max speed, with fallbacks for sports whose FIT lap message carries none.
+
+    Garmin omits speed from some lap messages entirely - every swim lap, where speed is
+    recorded on the length messages instead, and indoor laps on some devices. total_distance
+    over total_timer_time is the pace the watch displays. Max speed cannot be derived, so it
+    only gains the non-enhanced fallback. A rest lap has no distance and stays unknown rather
+    than 0, which a pace panel would divide by.
+    """
     speed = lap.get('enhanced_avg_speed')
     if speed is None:
         speed = lap.get('avg_speed')
@@ -1287,7 +1289,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Standing_Duration": lap_record.get('time_standing', None),
                                     "Avg_Speed": lap_record.get('enhanced_avg_speed', None),
                                     "Max_Speed": lap_record.get('enhanced_max_speed', None),
-                                    **_swim_lap_speed_fields(lap_record), # swim laps only: the FIT lap message carries no speed, so derive it
+                                    **_lap_speed_fields(lap_record), # enhanced -> plain -> derived from distance and timer time, for any lap whose FIT message has no speed
                                     "Calories": lap_record.get('total_calories', None),
                                     "Avg_Power": lap_record.get('avg_power', None),
                                     "Avg_HR": lap_record.get('avg_heart_rate', None),
