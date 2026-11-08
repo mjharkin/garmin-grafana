@@ -199,6 +199,17 @@ This project is made for InfluxDB 1.11, as Flux queries on influxDB 2.x can be p
 
 ✅ By default indoor activities FIT files lacking GPS data are not processed (Activity summaries are processed for all activities, just not the detailed intra-activity HR, Pace etc. which are included only inside the FIT files and require additional processing power) to save resources and processing time per fetched activity. If you want to process all activities regardless of GPS data availability associated with the activity, you can set `ALWAYS_PROCESS_FIT_FILES=True` in the environment variables section of the `garmin-fetch-data` container as that will ensure all FIT files are processed irrespective of GPS data availability with the activities.
 
+#### Swim fields
+
+Swim activities gain the fields below in addition to the ones every activity already has, and no existing field changes value or type. A pool swim records no GPS data, so its FIT file is only read when FIT processing is enabled for it (`ALWAYS_PROCESS_FIT_FILES=True`); an open water swim has a polyline and is processed either way.
+
+- `ActivitySummary` — `totalStrokes`, `averageSWOLF`, `averageSwimCadence`, `avgStrokesPerLength`, `activeLengths`, `poolLength`
+- `ActivitySession` — `Active_Lengths` (lengths actually swum); `Lengths` and `Laps` are untouched
+- `ActivityLap` — `SWOLF`, `Strokes`, `Active_Lengths`, `Swim_Stroke`, `Wkt_Step_Index`, and `Avg_Speed`/`Max_Speed` filled in where the FIT lap message carries no speed
+- `ActivityLength` — `Timer_Time`, `Length_Type` (`active`/`idle`), `SWOLF`; its existing fields are unchanged
+
+Two things to know when reading these: a swim also produces `ActivityGPS` rows with no coordinates, because the FIT records carry none, and SWOLF is not part of the FIT profile - the per-lap value comes from an unnamed field and the per-length value is derived as elapsed time plus strokes.
+
 ✅ If you are having missing data on previous days till midnight (which are available on Garmin Connect but missing on dashboard) or sync issues when using the automatic periodic fetching, consider updating the container to recent version and use `USER_TIMEZONE` environment variable under the `garmin-fetch-data` service. The value must be a valid tz identifier like `Europe/Budapest`. This variable is optional and the script tries to determine the timezone and fetch the UTC offset automatically if this variable is set as empty. If you see the automatic identification is not working for you, this variable can be used to override that behaviour and ensures the script is using the hardcoded timezone for all data fetching related activities. The previous gaps won't be filled (you need to fetch them using historic bulk update method), but moving forward, the script will keep everything in sync.
 
 ✅ Want this dashboard in **Imperial units** instead of **metric units**? I can't maintain two separate dashboards at the same time but here is an [excellent step-by-step guide](https://github.com/arpanghosh8453/garmin-grafana/issues/27#issuecomment-2817081738) on how you can do it yourself on your dashboard! Also, If you prefer 24 hours time format instead of 12 hour with AM/PM, you can remove `GF_DATE_FORMATS_*` ENV variables from the `compose.yml` file.
