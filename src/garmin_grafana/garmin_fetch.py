@@ -59,6 +59,7 @@ MAX_CONSECUTIVE_500_ERRORS = int(os.getenv("MAX_CONSECUTIVE_500_ERRORS", 10)) # 
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
+DEVICE_PROBE_INTERVAL_SECONDS = int(os.getenv("DEVICE_PROBE_INTERVAL_SECONDS", 900)) # optional, how often to look for scale and blood-pressure data that arrived without a watch sync (0 disables the check)
 FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,cycling_dynamics which you can add to the list seperated by , without any space
 ACTIVITY_TYPE_FILTER = [t.strip().lower() for t in os.getenv("ACTIVITY_TYPE_FILTER", "").split(",") if t.strip()] # optional, comma-separated list of activity typeKeys to import only specific activity types. Leave empty to import all. Known typeKeys: running,treadmill_running,indoor_running,cycling,indoor_cycling,road_biking,mountain_biking,walking,hiking,mountaineering,strength_training,hiit,indoor_cardio,elliptical,lap_swimming,open_water_swimming,rock_climbing,indoor_climbing,tennis_v2,kayaking_v2,boating_v2,multi_sport,other
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
@@ -286,6 +287,30 @@ def get_daily_stats(date_str):
     
 
 # %%
+def _latest_point_time(measurement):
+    """Newest stored timestamp for a measurement, as an aware UTC datetime, or None.
+
+    InfluxDB is the durable record of what we already hold: reading it back beats an in-memory
+    fingerprint, which resets on every restart and cannot explain itself. None means "unknown"
+    (empty measurement or query error), and the caller answers that by probing again rather
+    than by writing blindly.
+    """
+    try:
+        if INFLUXDB_VERSION == "1":
+            rows = list(influxdbclient.query(f'SELECT * FROM "{measurement}" ORDER BY time DESC LIMIT 1').get_points())
+            if not rows:
+                return None
+            return datetime.strptime(rows[0]['time'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.timezone("UTC"))
+        rows = influxdbclient.query(query=f'SELECT * FROM "{measurement}" ORDER BY time DESC LIMIT 1', language="influxql").to_pylist()
+        if not rows:
+            return None
+        stamp = rows[0]['time']
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=pytz.timezone("UTC"))
+    except Exception as err:
+        logging.warning(f"Could not read the latest {measurement} timestamp from InfluxDB: {err}")
+        return None
+
+
 def get_last_sync():
     global GARMIN_DEVICENAME
     global GARMIN_DEVICEID
@@ -619,6 +644,60 @@ def get_intraday_hrv(date_str):
     return points_list
 
 # %%
+def _newest_weigh_in_time(date_str):
+    """Newest weigh-in timestamp Garmin holds for a day, as aware UTC, or None.
+
+    Walks every dailyWeightSummary, not [0] like get_body_composition() does: the probe must be
+    able to see the second session of a day even though the current writer cannot. timestampGMT
+    is epoch milliseconds. A failed call returns None, which makes the caller write nothing.
+    """
+    try:
+        summaries = garmin_obj.get_weigh_ins(date_str, date_str).get('dailyWeightSummaries', []) or []
+    except Exception as err:
+        logging.warning(f"Weigh-in probe failed for {date_str}: {err}")
+        return None
+    newest = None
+    for summary in summaries:
+        for weight_dict in summary.get('allWeightMetrics', []) or []:
+            stamp = weight_dict.get('timestampGMT')
+            if stamp is None:
+                continue
+            when = datetime.fromtimestamp(stamp / 1000, tz=pytz.timezone("UTC"))
+            if newest is None or when > newest:
+                newest = when
+    return newest
+
+
+def _newest_blood_pressure_time(date_str):
+    """Newest blood-pressure timestamp Garmin holds for a day, as aware UTC, or None.
+
+    The fractional second is optional here even though the writer's parser insists on it: the
+    probe must not be the thing that breaks when Garmin shortens a timestamp.
+    """
+    try:
+        summaries = garmin_obj.get_blood_pressure(date_str, date_str).get('measurementSummaries', []) or []
+    except Exception as err:
+        logging.warning(f"Blood pressure probe failed for {date_str}: {err}")
+        return None
+    newest = None
+    for summary in summaries:
+        for measurement in summary.get('measurements', []) or []:
+            text = measurement.get('measurementTimestampGMT')
+            if text is None:
+                continue
+            text = str(text).rstrip('Z')
+            when = None
+            for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    when = datetime.strptime(text, fmt).replace(tzinfo=pytz.timezone("UTC"))
+                    break
+                except ValueError:
+                    continue
+            if when is not None and (newest is None or when > newest):
+                newest = when
+    return newest
+
+
 def get_body_composition(date_str):
     points_list = []
     weight_list_all = garmin_obj.get_weigh_ins(date_str, date_str).get('dailyWeightSummaries', [])
@@ -1741,6 +1820,54 @@ def get_lifestyle_data(date_str):
 
 
 # %%
+def _resolve_device_name():
+    """Fill GARMIN_DEVICENAME/GARMIN_DEVICEID from Garmin before anything is written.
+
+    Points are tagged with the device name, and InfluxDB treats a different tag value as a
+    different series: a point written while the name is still the "Unknown" default puts the
+    same reading in the database twice. get_last_sync() does this too, but only as a side effect
+    of a bulk fetch, which is exactly what has not happened yet on the watch-independent path.
+    """
+    global GARMIN_DEVICENAME, GARMIN_DEVICEID
+    try:
+        sync_data = garmin_obj.get_device_last_used()
+    except Exception as err:
+        logging.warning(f"Could not resolve the Garmin device name: {err}")
+        return
+    GARMIN_DEVICENAME = sync_data.get('lastUsedDeviceName') or "Unknown"
+    GARMIN_DEVICEID = sync_data.get('userDeviceId') or None
+
+
+def fetch_write_devices(date_str):
+    """Write only the measurements that come from devices other than the watch.
+
+    Deliberately not daily_fetch_write(): that pulls the whole day's intraday series, the cost
+    the watch gate exists to avoid. Each metric is written only when FETCH_SELECTION asked for
+    it, so a deployment that does not collect blood pressure neither polls nor writes it.
+    Points are keyed by the reading's own timestamp, so re-running this is idempotent.
+    """
+    if GARMIN_DEVICENAME_AUTOMATIC and GARMIN_DEVICENAME == "Unknown":
+        _resolve_device_name() # once: every point must carry the real device name, see the helper
+    written = 0
+    if 'body_composition' in FETCH_SELECTION:
+        try:
+            points = get_body_composition(date_str)
+            write_points_to_influxdb(points)
+            written += len(points)
+        except Exception as err:
+            logging.warning(f"Body composition write failed for {date_str}: {err}")
+    if 'blood_pressure' in FETCH_SELECTION:
+        try:
+            points = get_blood_pressure(date_str)
+            write_points_to_influxdb(points)
+            written += len(points)
+        except Exception as err:
+            logging.warning(f"Blood pressure write failed for {date_str}: {err}")
+    if written:
+        logging.info(f"Success : Fetched {written} scale/blood-pressure point(s) for {date_str}")
+    return written
+
+
 def daily_fetch_write(date_str):
     if REQUEST_INTRADAY_DATA_REFRESH and (datetime.strptime(date_str, "%Y-%m-%d") <= (datetime.today() - timedelta(days=IGNORE_INTRADAY_DATA_REFRESH_DAYS))):
         data_refresh_response = garmin_obj.connectapi(f"wellness-service/wellness/epoch/request/{date_str}", method="POST").get("status", "Unknown")
@@ -1920,6 +2047,7 @@ if __name__ == "__main__":
             logging.warning(f"Unable to determine user's timezone - Defaulting to UTC. Consider providing TZ identifier with USER_TIMEZONE environment variable")
             local_timediff = timedelta(hours=0)
         
+        next_device_probe = 0 # probe once on startup, then on the interval
         while True:
             last_watch_sync_time_UTC = datetime.fromtimestamp(int(garmin_obj.get_device_last_used().get('lastUsedDeviceUploadTime')/1000)).astimezone(pytz.timezone("UTC"))
             if last_influxdb_sync_time_UTC < last_watch_sync_time_UTC:
@@ -1928,5 +2056,25 @@ if __name__ == "__main__":
                 last_influxdb_sync_time_UTC = last_watch_sync_time_UTC
             else:
                 logging.info(f"No new data found : Current watch and influxdb sync time is {last_watch_sync_time_UTC} UTC")
+
+            # Scale and blood-pressure readings arrive from devices the watch sync clock knows
+            # nothing about, so they are checked on their own interval and compared against what
+            # InfluxDB already holds. Only metrics named in FETCH_SELECTION are touched.
+            if DEVICE_PROBE_INTERVAL_SECONDS > 0 and time.time() >= next_device_probe:
+                next_device_probe = time.time() + DEVICE_PROBE_INTERVAL_SECONDS
+                today_local = (datetime.now(tz=pytz.timezone("UTC")) + local_timediff).strftime('%Y-%m-%d')
+                if 'body_composition' in FETCH_SELECTION:
+                    newest = _newest_weigh_in_time(today_local)
+                    stored = _latest_point_time("BodyComposition")
+                    if newest is not None and (stored is None or newest > stored):
+                        logging.info(f"Update found : weigh-in at {newest} is newer than the stored point ({stored}) - the watch has not synced")
+                        fetch_write_devices(today_local)
+                if 'blood_pressure' in FETCH_SELECTION:
+                    newest = _newest_blood_pressure_time(today_local)
+                    stored = _latest_point_time("BloodPressure")
+                    if newest is not None and (stored is None or newest > stored):
+                        logging.info(f"Update found : blood pressure at {newest} is newer than the stored point ({stored}) - the watch has not synced")
+                        fetch_write_devices(today_local)
+
             logging.info(f"waiting for {UPDATE_INTERVAL_SECONDS} seconds before next automatic update calls")
             time.sleep(UPDATE_INTERVAL_SECONDS)
