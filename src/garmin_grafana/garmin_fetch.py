@@ -65,6 +65,7 @@ LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").uppe
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
 FIT_FILE_STORAGE_LOCATION = os.getenv("FIT_FILE_STORAGE_LOCATION", os.path.join(os.path.expanduser("~"), "fit_filestore"))
 ALWAYS_PROCESS_FIT_FILES = True if os.getenv("ALWAYS_PROCESS_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional, will process all FIT files for all activities including indoor ones lacking GPS data
+ALWAYS_PROCESS_ACTIVITY_TYPES = [t.strip().lower() for t in os.getenv("ALWAYS_PROCESS_ACTIVITY_TYPES", "").split(",") if t.strip()] # optional, comma-separated activity typeKeys whose FIT files are always processed even without GPS data - a finer alternative to ALWAYS_PROCESS_FIT_FILES, e.g. lap_swimming,open_water_swimming
 REQUEST_INTRADAY_DATA_REFRESH = True if os.getenv("REQUEST_INTRADAY_DATA_REFRESH") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional, This requests data refresh for the intraday data (older than 6 months) - see issue #77. Pauses the script for 24 hours when the daily limit is reached.
 IGNORE_INTRADAY_DATA_REFRESH_DAYS = int(os.getenv("IGNORE_INTRADAY_DATA_REFRESH_DAYS", 30)) # optional, ignores the REQUEST_INTRADAY_DATA_REFRESH for the specified number of days from current date. 
 TAG_MEASUREMENTS_WITH_USER_EMAIL = True if os.getenv("TAG_MEASUREMENTS_WITH_USER_EMAIL") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # Adds an additional "User_ID" tag in each measurement for multi user database support - see #96
@@ -661,9 +662,11 @@ def get_activity_summary(date_str):
         logging.info(f"ACTIVITY_TYPE_FILTER active: kept {len(activity_list)} activities matching {ACTIVITY_TYPE_FILTER}")
     for activity in activity_list:
         activity_type_key = (activity.get('activityType') or {}).get('typeKey', "Unknown")
-        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES: # will process FIT files lacking GPS data if ALWAYS_PROCESS_FIT_FILES is set to True
+        fit_process_by_type = (activity_type_key or "").lower() in ALWAYS_PROCESS_ACTIVITY_TYPES
+        if activity.get('hasPolyline') or ALWAYS_PROCESS_FIT_FILES or fit_process_by_type: # will process FIT files lacking GPS data if ALWAYS_PROCESS_FIT_FILES is set to True, or if the activity type is listed in ALWAYS_PROCESS_ACTIVITY_TYPES
             if not activity.get('hasPolyline'):
-                logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as ALWAYS_PROCESS_FIT_FILES is on")
+                reason = "ALWAYS_PROCESS_FIT_FILES is on" if ALWAYS_PROCESS_FIT_FILES else f"activity type {activity_type_key} is in ALWAYS_PROCESS_ACTIVITY_TYPES"
+                logging.warning(f"Activity ID {activity.get('activityId')} got no GPS data - yet, activity FIT file data will be processed as {reason}")
             activity_with_gps_id_dict[activity.get('activityId')] = activity_type_key
         # Collect strength training activities for API-based exercise set fetching
         if 'strength' in activity_type_key.lower() and activity.get('startTimeGMT'):
